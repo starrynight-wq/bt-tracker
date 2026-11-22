@@ -1,0 +1,12 @@
+run = "npm start"
+language = "nodejs"
+nix = "pkgs.nodejs_20"
+
+[[ports]]
+localPort = 3000
+
+[env]
+PORT = "3000"
+TRACKER_INTERVAL = "1800"
+TRACKER_MIN_INTERVAL = "900"
+TRACKER_ID = "bt-tracker"

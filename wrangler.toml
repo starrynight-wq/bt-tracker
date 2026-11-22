@@ -1,0 +1,24 @@
+name = "bt-tracker"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+BT_INTERVAL = "1800"
+BT_MIN_INTERVAL = "900"
+BT_TRACKER_ID = "bt-tracker"
+
+[[kv_namespaces]]
+binding = "BT_TORRENTS"
+id = "bt_torrents"
+preview_id = "bt_torrents_preview"
+
+[[kv_namespaces]]
+binding = "BT_TRACKERS"
+id = "bt_trackers"
+preview_id = "bt_trackers_preview"
+
+[[kv_namespaces]]
+binding = "BT_ALERTS"
+id = "bt_alerts"
+preview_id = "bt_alerts_preview"
