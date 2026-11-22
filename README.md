@@ -9,6 +9,7 @@
 | 🌐 **HTTP/HTTPS Tracker** | 标准 `/announce` 和 `/scrape` 接口，返回标准 bencode 响应 |
 | 👥 **Peer 联邦聚合** | 配置多个外部 tracker，客户端 announce 时自动向上游查询并将返回的有效 peer 与本地 peer 去重合并 |
 | 🖥️ **网页管理面板** | `/dashboard` 提供可视化管理：统计卡片、外部 tracker 列表、种子列表、用量提醒 |
+| 📅 **今日 Tracker 使用情况** | 面板自动刷新，只显示当天成功使用过的外部 tracker（含最后使用时间），并提供全部 tracker 的使用状态徽标 |
 | 🔔 **用量提醒 (Alerts)** | 可为 `peers` / `torrents` / `announces` / `scrapes` 设定阈值，超过时通过 Webhook 或日志通知 |
 | 📦 **导入/导出** | 管理后台支持 JSON 格式的种子/peer 状态导出与导入（支持 `?merge=false`） |
 | 💾 **持久化** | Cloudflare KV（Worker）或 JSON 文件（Replit/Node） |
@@ -19,18 +20,41 @@
 ```
 bt-tracker/
 ├── public/
-│   └── dashboard.html      # 网页管理面板（单文件，无需构建）
+│   ├── dashboard.html      # 网页管理面板（单文件，无需构建，唯一数据源）
+│   └── _routes.json        # Cloudflare Pages Functions 路由白名单
+├── functions/
+│   └── [[path]].js         # Cloudflare Pages Functions 入口（适配 onRequest）
 ├── src/
 │   ├── bencode.js          # bencode 编解码（Node + Cloudflare Worker 通用）
-│   ├── store.js            # 存储层：MemoryStore / FileStore（Node 文件） / KvStore（CF KV）
+│   ├── store.js            # 存储层：MemoryStore / KvStore（CF KV），纯运行时无关代码
+│   ├── file-store.js       # FileStore（Node/Replit 文件持久化）
 │   ├── tracker.js          # Tracker 核心：announce/scrape/stats/admin/外部合并/提醒
 │   ├── server.js           # Node.js HTTP 服务器入口（Replit）
-│   ├── worker.js           # Cloudflare Worker 入口（CLI 部署用）
-│   └── worker-bundle.js    # 单文件 Worker 打包（Cloudflare 网页控制台部署用，无需 CLI）
+│   ├── worker.js           # Cloudflare Workers 入口（CLI / Git 部署）
+│   ├── dashboard-html.js   # 【自动生成】dashboard.html 作为 ESM 字符串
+│   └── worker-bundle.js    # 【自动生成】单文件 Worker 打包（网页控制台粘贴部署）
+├── scripts/
+│   ├── build.mjs           # 生成 dashboard-html.js 与 worker-bundle.js
+│   ├── test.mjs            # 运行 test/ 下的单元测试
+│   └── e2e-smoke.mjs       # Node 端到端冒烟测试
+├── test/                   # node:test 单元测试
 ├── .replit                 # Replit 运行配置
 ├── package.json            # Node 入口 (npm start → src/server.js)
 ├── wrangler.toml           # Cloudflare Workers 部署配置
+├── wrangler.pages.toml     # Cloudflare Pages 部署配置
 └── README.md               # 本文件
+```
+
+> `src/dashboard-html.js` 和 `src/worker-bundle.js` 由 `npm run build` 从
+> `public/dashboard.html` 与 `src/*.js` 自动生成，请不要手动修改；修改页面后重新构建即可。
+
+### 本地开发与构建
+
+```bash
+npm start          # 启动 Node/Replit 服务器（http://localhost:3000）
+npm run build      # 重新生成 dashboard-html.js 和 worker-bundle.js
+npm test           # 单元测试（tracker 使用统计、worker/bundle 路由、Pages Functions）
+npm run smoke      # 端到端测试：announce → 上游 tracker → 今日使用统计
 ```
 
 ---
@@ -87,6 +111,8 @@ Replit 是最快的上手方式，无需安装任何工具，在浏览器里即�
 | `TRACKER_ID` | `bt-tracker` | Tracker 标识 |
 | `TORRENTS_PATH` | `data/torrents.json` | 种子数据文件路径 |
 | `TRACKERS_PATH` | `data/trackers.json` | 外部 tracker 配置文件路径 |
+| `ALERTS_PATH` | `data/alerts.json` | 提醒规则文件路径 |
+| `DASHBOARD_PATH` | `public/dashboard.html` | 管理面板 HTML 路径 |
 
 ---
 
@@ -179,7 +205,6 @@ Cloudflare Workers 将你的 Tracker 部署到全球边缘节点，访问速度�
    name = "bt-tracker"
    main = "src/worker.js"
    compatibility_date = "2024-01-01"
-   compatibility_flags = ["nodejs_compat"]
 
    [vars]
    BT_INTERVAL = "1800"
@@ -202,49 +227,80 @@ Cloudflare Workers 将你的 Tracker 部署到全球边缘节点，访问速度�
    preview_id = "ghi789jkl012-preview"
    ```
 
-   > ⚠️ `id` 和 `preview_id` 都需要填。preview_id 通常在创建命令输出的 `preview_id` 字段中；如果没有，可以再运行一次 `wrangler kv:namespace create` 查看，或在 Cloudflare 仪表板的 **Workers & Pages → KV** 中手动创建并绑定。
-
 3. **部署**
    ```bash
    wrangler deploy
    ```
 
-   部署成功后会输出一个类似 `https://bt-tracker.<subdomain>.workers.dev` 的 URL。
-
-4. **访问管理面板**
-   ```
-   https://你的-worker-domain.workers.dev/dashboard
-   ```
-
-5. **通过 Cloudflare 仪表板绑定 KV（可选）**
-   如果不想手动编辑 `wrangler.toml`，也可以在 Cloudflare 仪表板中：
-   - 进入 **Workers & Pages** → 你的 Worker → **设置** → **绑定变量**
-   - 添加三个 KV 命名空间绑定，变量名分别为 `BT_TORRENTS`、`BT_TRACKERS`、`BT_ALERTS`
+4. **访问**
+   - 部署成功后，会显示 `https://bt-tracker.<你的子域>.workers.dev`
+   - 管理面板：`https://bt-tracker.<你的子域>.workers.dev/dashboard`
+   - Tracker 接口：`https://bt-tracker.<你的子域>.workers.dev/announce?...`
 
 ---
 
+### 方案三：Cloudflare Pages（静态站点 + Pages Functions）
 
-## 🖥️ 本地开发 / Docker 部署
+Pages 适合把管理面板作为静态站点托管，同时用 Pages Functions 运行 Tracker API。项目已内置所需文件：
 
-### 本地运行（Node.js）
+- `public/`：静态资源（构建输出目录），包含 `dashboard.html` 与 `_routes.json`
+- `functions/[[path]].js`：Pages Functions 入口，复用 `src/worker.js` 的同一套路由逻辑
+- `public/_routes.json`：只让 `/announce`、`/scrape`、`/stats`、`/admin/*`、`/dashboard`、`/` 进入 Functions，其余静态资源仍由 Pages CDN 直接返回
+- `wrangler.pages.toml`：Pages 的 Wrangler 配置（KV 绑定、变量、`pages_build_output_dir`）
 
-```bash
-# 克隆或下载项目
-git clone <你的仓库地址>
-cd bt-tracker
+> 注意：一个 Wrangler 配置不能同时包含 `main` 和 `pages_build_output_dir`，
+> 因此 Workers 用 `wrangler.toml`，Pages 用 `wrangler.pages.toml`。
 
-# 安装依赖（本项目无外部依赖，可跳过）
-npm install
+#### 方式 A：Git 集成（控制台操作，无需本地 CLI）
 
-# 启动
-npm start
-# 或
-node src/server.js
+1. **创建 KV 命名空间**
+   - 进入 **Workers & Pages** → **KV**，创建三个命名空间：`BT_TORRENTS`、`BT_TRACKERS`、`BT_ALERTS`，并记下 ID。
 
-# 访问
-# http://localhost:3000/announce?...
-# http://localhost:3000/dashboard
-```
+2. **创建 Pages 项目**
+   - **Workers & Pages** → **Pages** → **创建项目** → **连接到 Git**，选择 `bt-tracker` 仓库。
+
+3. **配置构建设置**
+   - **构建命令**：`npm run build`（重新生成 `src/dashboard-html.js` 与 `src/worker-bundle.js`；若仓库中已提交生成结果，也可留空）
+   - **构建输出目录**：`public`
+   - **Root 目录**：`/`（默认）
+
+4. **绑定 KV 与变量**
+   - Pages 项目 → **设置** → **函数** → **KV 命名空间绑定**，添加：
+     | 变量名 | KV 命名空间 |
+     |--------|-------------|
+     | `BT_TORRENTS` | BT_TORRENTS |
+     | `BT_TRACKERS` | BT_TRACKERS |
+     | `BT_ALERTS` | BT_ALERTS |
+   - 同页面的 **环境变量** 中可选添加 `BT_INTERVAL=1800`、`BT_MIN_INTERVAL=900`、`BT_TRACKER_ID=bt-tracker`。
+
+5. **部署并访问**
+   - 推送到 GitHub 触发自动部署。
+   - 管理面板：`https://<项目名>.pages.dev/dashboard`
+   - Tracker 接口：`https://<项目名>.pages.dev/announce?...`
+
+#### 方式 B：Wrangler CLI 部署
+
+1. **准备 KV ID**
+   - 将 `wrangler.pages.toml` 中的 `id` / `preview_id` 替换为真实 KV 命名空间 ID。
+
+2. **部署**
+   ```bash
+   npm install -g wrangler
+   wrangler login
+   npx wrangler pages deploy --config wrangler.pages.toml
+   ```
+
+3. **本地预览（可选）**
+   ```bash
+   npx wrangler pages dev public --config wrangler.pages.toml
+   ```
+
+> **说明**：Pages Functions 使用 `onRequest(context)` 形式，`functions/[[path]].js`
+> 会把 `context.request`、`context.env` 转交给 `src/worker.js` 的 `fetch` 处理，
+> 因此 Workers / Pages / Node 三种部署行为一致；`context.env` 中的 KV 绑定与变量在
+> Pages 项目设置里配置即可。
+
+---
 
 ### Docker 部署（可选）
 
@@ -303,7 +359,7 @@ services:
 | `left` | integer | 剩余字节数 |
 | `event` | string | `started` / `stopped` / `completed` / 空 |
 | `compact` | 0/1 | 是否使用 compact peer 列表（推荐 1） |
-| `numwant` | integer | 希望返回的 peer �量上限 |
+| `numwant` | integer | 希望返回的 peer 数量上限 |
 
 响应（bencoded）：
 ```
@@ -344,8 +400,32 @@ d8:completei<数量>e10:incompletei<数量>e8:intervali<秒数>e12:min intervali
 | `POST` | `/admin/alerts` | 添加提醒规则 |
 | `PATCH` | `/admin/alerts/<id>` | 修改提醒规则 |
 | `DELETE` | `/admin/alerts/<id>` | 删除提醒规则 |
+| `GET` | `/admin/tracker-links` | 列出启用的外部 tracker 及使用情况（今日是否使用） |
 | `GET` | `/admin/export` | 导出所有种子/peer 状态为 JSON |
 | `POST` | `/admin/import` | 导入种子/peer 状态（`?merge=false` 跳过已存在） |
+
+#### `/admin/tracker-links` 响应
+
+```json
+{
+  "ok": true,
+  "trackers": [
+    {
+      "url": "http://tracker.example.com:6969/announce",
+      "enabled": true,
+      "addedAt": 1700000000000,
+      "lastUsedAt": 1700003600000,
+      "usedToday": true,
+      "usedDate": "2024-11-22T10:33:20.000Z"
+    }
+  ]
+}
+```
+
+- 只返回 `enabled: true` 的 tracker。
+- `lastUsedAt`：最近一次成功向上游 tracker 发起请求的时间（毫秒时间戳，0 表示从未使用）。
+- `usedToday`：`lastUsedAt` 是否在当前服务器本地时间的“今天”内（Workers 环境为 UTC）。
+- 每次成功的上游 announce 合并都会调用 `touchTracker` 更新该字段。
 
 #### 提醒规则字段
 
@@ -393,8 +473,10 @@ curl -X POST http://你的-tracker/admin/import -H 'Content-Type: application/js
 - **外部 tracker 管理**：添加、启用/禁用、删除上游 tracker
 - **用量提醒**：添加/编辑/删除提醒规则，查看最后触发时间
 - **种子列表**：查看所有已记录种子的 info hash、peer 数、完成数、时间
+- **追踪器链接（今日使用）**：新增「📅 今日使用的外部 Tracker」区块，**只显示今天成功使用过的外部 tracker**，每 30 秒自动刷新并显示最后更新时间
+- **外部 tracker 管理表格**：显示全部已启用 tracker 的 ✅/❌ 今日使用状态、最后使用时间、添加时间
 
-面板会自动轮询刷新数据（统计 15 秒、tracker 和提醒 30 秒）。
+面板会自动轮询刷新数据（统计 15 秒、今日使用的 tracker 与 tracker 列表 30 秒）。
 
 ---
 

@@ -203,6 +203,8 @@ export class Tracker {
             extPeers = extPeers.concat(res.peers || []);
             if (res.complete !== undefined) extComplete += res.complete;
             if (res.incomplete !== undefined) extIncomplete += res.incomplete;
+            // mark this tracker as used today
+            try { await this._store.touchTracker(url); } catch (e) { console.error('[tracker] touchTracker failed', url, e); }
           }
         } catch (e) {
           console.error('[tracker] external tracker error', url, e);
@@ -332,6 +334,30 @@ export class Tracker {
     if (note !== undefined) cfg.note = note;
     await this._store.putTracker(url, cfg);
     return { ok: true };
+  }
+  /* List trackers with their current usage status (last used today?) */
+  async getTrackerLinks() {
+    const tr = await this._store.getTrackers();
+    const now = Date.now();
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayStartMs = todayStart.getTime();
+    const links = [];
+    for (const [url, cfg] of tr) {
+      if (!cfg.enabled) continue;
+      const lastUsedAt = cfg.lastUsedAt || 0;
+      const usedToday = lastUsedAt >= todayStartMs;
+      const usedDate = lastUsedAt ? new Date(lastUsedAt) : null;
+      links.push({
+        url,
+        enabled: cfg.enabled,
+        addedAt: cfg.addedAt || 0,
+        lastUsedAt,
+        usedToday,
+        usedDate: usedDate ? usedDate.toISOString() : null
+      });
+    }
+    return { ok: true, trackers: links };
   }
 
   /* ----------------------- admin: import / export ----------------------- */

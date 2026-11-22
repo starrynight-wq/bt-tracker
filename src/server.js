@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { FileStore } from './store.js';
+import { FileStore } from './file-store.js';
 import { Tracker } from './tracker.js';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -11,7 +11,8 @@ const TRACKER_ID = process.env.TRACKER_ID || 'bt-tracker';
 
 const store = new FileStore({
   torrentsPath: process.env.TORRENTS_PATH,
-  trackersPath: process.env.TRACKERS_PATH
+  trackersPath: process.env.TRACKERS_PATH,
+  alertsPath: process.env.ALERTS_PATH
 });
 
 const tracker = new Tracker({
@@ -72,7 +73,7 @@ async function init() {
   await store.init();
 }
 
-const DASHBOARD_PATH = join(process.cwd(), 'public', 'dashboard.html');
+const DASHBOARD_PATH = process.env.DASHBOARD_PATH || join(process.cwd(), 'public', 'dashboard.html');
 let dashboardHtml = null;
 async function loadDashboardHtml() {
   try {
@@ -194,6 +195,12 @@ const server = createServer(async (req, res) => {
       try { data = JSON.parse(body || '{}'); } catch { send(400, JSON.stringify({ ok: false, error: 'invalid json' }), 'application/json'); return; }
       const merge = query.merge !== 'false';
       const r = await tracker.importTorrents(data, { merge });
+      send(200, JSON.stringify(r), 'application/json');
+      return;
+    }
+
+    if (path === '/admin/tracker-links') {
+      const r = await tracker.getTrackerLinks();
       send(200, JSON.stringify(r), 'application/json');
       return;
     }

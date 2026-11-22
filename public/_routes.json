@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "include": [
+    "/",
+    "/announce",
+    "/scrape",
+    "/stats",
+    "/admin/*",
+    "/dashboard",
+    "/dashboard/"
+  ],
+  "exclude": []
+}

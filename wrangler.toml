@@ -1,7 +1,16 @@
+# Cloudflare Workers deployment configuration.
+#
+# Deploy:  npx wrangler deploy
+#
+# For Cloudflare Pages use ./wrangler.pages.toml instead (a single Wrangler
+# config cannot contain both `main` and `pages_build_output_dir`).
+#
+# Replace the KV namespace `id`s with the real ones from:
+#   Dashboard -> Workers & Pages -> KV
+
 name = "bt-tracker"
 main = "src/worker.js"
 compatibility_date = "2024-01-01"
-compatibility_flags = ["nodejs_compat"]
 
 [vars]
 BT_INTERVAL = "1800"

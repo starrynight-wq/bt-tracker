@@ -46,6 +46,8 @@
   .empty { color: #9ca3af; font-size: 14px; text-align: center; padding: 30px; }
   .status-good { color: #166534; }
   .status-bad { color: #991b1b; }
+  .tracker-summary { font-size: 13px; color: #6b7280; margin-bottom: 10px; }
+  .tracker-summary b { font-size: 14px; }
   .refresh-btn { margin-left: auto; }
   .hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #4b5563; word-break: break-all; max-width: 160px; }
   .alert-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #f3f4f6; }
@@ -103,6 +105,16 @@
       <div class="muted">自启动以来</div>
     </div>
   </div>
+
+  <!-- 今日使用的外部 Tracker（自动刷新） -->
+  <section class="section">
+    <div class="section-title" style="justify-content:space-between;">
+      <span>📅 今日使用的外部 Tracker</span>
+      <span class="muted" id="trackerTodayUpdated" style="font-size:12px;"></span>
+    </div>
+    <p class="muted" style="margin-bottom:12px;">只显示今天成功使用过的外部 tracker，列表每 30 秒自动刷新。</p>
+    <div id="trackerTodayList" class="loading">加载中...</div>
+  </section>
 
   <!-- 外部 Tracker 管理 -->
   <section class="section">
@@ -191,19 +203,37 @@ async function loadStats() {
 
 async function loadTrackers() {
   try {
-    const r = await api('/admin/trackers');
+    const [all, links] = await Promise.all([
+      api('/admin/trackers'),
+      api('/admin/tracker-links')
+    ]);
     const el = document.getElementById('trackerList');
-    const trs = r.trackers || [];
+    const trs = all.trackers || [];
+    const usage = new Map((links.trackers || []).map(t => [t.url, t]));
     if (trs.length === 0) { el.innerHTML = '<div class="empty">暂无外部 tracker，添加一个以上联邦同步 peer。</div>'; return; }
-    let html = '<table><thead><tr><th>URL</th><th>备注</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+    const enabledCount = trs.filter(t => t.enabled).length;
+    const usedCount = trs.filter(t => usage.get(t.url) && usage.get(t.url).usedToday).length;
+    let html = `<div class="tracker-summary">今日已使用 <b class="status-good">${usedCount}</b> / ${enabledCount} 个已启用的外部 tracker</div>`;
+    html += '<table><thead><tr><th>URL</th><th>备注</th><th>状态</th><th>今日使用</th><th>最后使用</th><th>添加时间</th><th>操作</th></tr></thead><tbody>';
     for (const tr of trs) {
+      const u = usage.get(tr.url);
       const enabledCls = tr.enabled ? 'badge-ok' : 'badge-bad';
       const enabledTxt = tr.enabled ? '启用' : '禁用';
-      const urlDisplay = tr.url.length > 60 ? tr.url.slice(0, 57) + '...' : tr.url;
+      const urlDisplay = tr.url.length > 70 ? tr.url.slice(0, 67) + '...' : tr.url;
+      const todayBadge = !tr.enabled
+        ? '<span class="badge badge-warn">—</span>'
+        : (u && u.usedToday
+          ? '<span class="badge badge-ok">✅ 已使用</span>'
+          : '<span class="badge badge-bad">❌ 未使用</span>');
+      const lastUsedStr = u && u.lastUsedAt ? new Date(u.lastUsedAt).toLocaleString() : '-';
+      const addedStr = (u && u.addedAt) || tr.addedAt ? new Date((u && u.addedAt) || tr.addedAt).toLocaleString() : '-';
       html += `<tr>
         <td><span class="hash" title="${tr.url}">${urlDisplay}</span></td>
         <td>${tr.note || '-'}</td>
         <td><span class="badge ${enabledCls}">${enabledTxt}</span></td>
+        <td>${todayBadge}</td>
+        <td class="muted">${lastUsedStr}</td>
+        <td class="muted">${addedStr}</td>
         <td>
           <button class="btn btn-sm" onclick="toggleTracker('${escapeHtml(tr.url)}', ${!tr.enabled})">${tr.enabled ? '禁用' : '启用'}</button>
           <button class="btn btn-sm btn-danger" onclick="deleteTracker('${escapeHtml(tr.url)}')">删除</button>
@@ -214,6 +244,37 @@ async function loadTrackers() {
     el.innerHTML = html;
   } catch (e) {
     document.getElementById('trackerList').innerHTML = '<div class="empty status-bad">加载失败: ' + e.message + '</div>';
+  }
+}
+
+/* 今日使用列表：只显示今天成功使用过的外部 tracker，自动刷新 */
+async function loadTodayTrackers() {
+  const el = document.getElementById('trackerTodayList');
+  try {
+    const r = await api('/admin/tracker-links');
+    const used = (r.trackers || []).filter(t => t.usedToday);
+    const updated = document.getElementById('trackerTodayUpdated');
+    if (updated) updated.textContent = '更新于 ' + new Date().toLocaleTimeString();
+    if (used.length === 0) {
+      el.innerHTML = '<div class="empty">今天还没有使用过任何外部 tracker。</div>';
+      return;
+    }
+    used.sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+    let html = '<table><thead><tr><th>URL</th><th>最后使用</th><th>添加时间</th></tr></thead><tbody>';
+    for (const tr of used) {
+      const urlDisplay = tr.url.length > 70 ? tr.url.slice(0, 67) + '...' : tr.url;
+      const lastUsedStr = tr.lastUsedAt ? new Date(tr.lastUsedAt).toLocaleString() : '-';
+      const addedStr = tr.addedAt ? new Date(tr.addedAt).toLocaleDateString() : '-';
+      html += `<tr>
+        <td><span class="hash" title="${tr.url}">${urlDisplay}</span></td>
+        <td>${lastUsedStr}</td>
+        <td class="muted">${addedStr}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = '<div class="empty status-bad">加载失败: ' + e.message + '</div>';
   }
 }
 
@@ -341,10 +402,12 @@ function escapeHtml(s) {
 
 document.addEventListener('DOMContentLoaded', () => {
   loadStats();
+  loadTodayTrackers();
   loadTrackers();
   loadAlerts();
   loadTorrents();
   setInterval(loadStats, 15000);
+  setInterval(loadTodayTrackers, 30000);
   setInterval(loadTrackers, 30000);
   setInterval(loadAlerts, 30000);
 });

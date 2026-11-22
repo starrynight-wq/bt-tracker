@@ -1,7 +1,11 @@
 'use strict';
 
 /*
- * Storage layer for the tracker.
+ * Storage layer for the tracker (runtime-agnostic).
+ *
+ * This module must stay free of Node.js-only imports so it can be bundled
+ * for Cloudflare Workers and Pages Functions. The Node/Replit file store
+ * lives in ./file-store.js instead.
  *
  * Store interface (all methods return Promises so both sync in-memory and
  * async KV/file backends share one API):
@@ -11,6 +15,7 @@
  *   getTrackers()          -> Map<url, TrackerConfig>
  *   putTracker(url, config)
  *   deleteTracker(url)
+ *   touchTracker(url)      -> update lastUsedAt of an existing tracker (no-op if missing)
  *   close()
  *
  * Torrent shape:
@@ -38,11 +43,10 @@
  *     url: string,
  *     enabled: boolean,
  *     addedAt: number,
- *     note?: string
+ *     note?: string,
+ *     lastUsedAt?: number   // timestamp of last successful external fetch (ms)
  *   }
  */
-
-import { encode, decodeSync } from './bencode.js';
 
 function now() { return Date.now(); }
 
@@ -63,6 +67,7 @@ export class Store {
   async getTrackers() { throw new Error('not implemented'); }
   async putTracker(url, config) { throw new Error('not implemented'); }
   async deleteTracker(url) { throw new Error('not implemented'); }
+  async touchTracker(url) { return undefined; }
   async close() { return undefined; }
 
   /* Usage alerts (optional) */
@@ -72,7 +77,7 @@ export class Store {
 }
 
 /* ------------------------------------------------------------------ */
-/* In-memory store (Replit dev / local testing / single instance)     */
+/* In-memory store (tests / single instance)                          */
 /* ------------------------------------------------------------------ */
 
 export class MemoryStore extends Store {
@@ -92,14 +97,16 @@ export class MemoryStore extends Store {
   async deleteTorrent(infoHash) {
     this._torrents.delete(infoHash);
   }
-  async getTrackers() {
-    return new Map(this._trackers);
-  }
+  async getTrackers() { return new Map(this._trackers); }
   async putTracker(url, config) {
     this._trackers.set(url, { ...config, url });
   }
   async deleteTracker(url) {
     this._trackers.delete(url);
+  }
+  async touchTracker(url) {
+    const cfg = this._trackers.get(url);
+    if (cfg) this._trackers.set(url, { ...cfg, lastUsedAt: Date.now() });
   }
   async getAlerts() {
     return new Map(this._alerts);
@@ -109,173 +116,6 @@ export class MemoryStore extends Store {
   }
   async deleteAlert(id) {
     this._alerts.delete(id);
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* JSON file store (Node.js / Replit persistent filesystem)           */
-/* ------------------------------------------------------------------ */
-
-const fs = await import('fs');
-const path = await import('path');
-
-export class FileStore extends Store {
-  constructor({ torrentsPath, trackersPath } = {}) {
-    super();
-    this._fs = fs;
-    this._path = path;
-    this._torrentsPath = torrentsPath || path.join(process.cwd(), 'data', 'torrents.json');
-    this._trackersPath = trackersPath || path.join(process.cwd(), 'data', 'trackers.json');
-    this._alertsPath = path.join(process.cwd(), 'data', 'alerts.json');
-    this._torrents = new Map();
-    this._trackers = new Map();
-    this._alerts = new Map();
-    this._dirty = false;
-    this._flushTimer = null;
-  }
-
-  async init() {
-    await this._load();
-    // Periodic flush every 30s while running
-    if (typeof setInterval !== 'undefined') {
-      this._flushTimer = setInterval(() => this.flush(), 30000);
-      if (this._flushTimer.unref) this._flushTimer.unref();
-    }
-  }
-
-  async _load() {
-    const fs = this._fs;
-    try {
-      const raw = fs.promises ? await fs.promises.readFile(this._torrentsPath, 'utf8') : await this._readFile(this._torrentsPath);
-      const obj = JSON.parse(raw);
-      if (obj && typeof obj === 'object') {
-        for (const [ih, t] of Object.entries(obj)) {
-          this._torrents.set(ih, { ...t, peers: t.peers || {} });
-        }
-      }
-    } catch (e) {
-      if (e && (e.code === 'ENOENT' || e.message && e.message.includes('ENOENT'))) {
-        // first run, no data yet
-      } else {
-        console.error('[tracker] failed to load torrents:', e);
-      }
-    }
-    try {
-      const raw = fs.promises ? await fs.promises.readFile(this._trackersPath, 'utf8') : await this._readFile(this._trackersPath);
-      const obj = JSON.parse(raw);
-      if (obj && typeof obj === 'object') {
-        for (const [url, c] of Object.entries(obj)) {
-          this._trackers.set(url, c);
-        }
-      }
-    } catch (e) {
-      if (e && (e.code === 'ENOENT' || e.message && e.message.includes('ENOENT'))) {
-        // first run
-      } else {
-        console.error('[tracker] failed to load trackers:', e);
-      }
-    }
-    // load alerts
-    try {
-      const raw = fs.promises ? await fs.promises.readFile(this._alertsPath, 'utf8') : await this._readFile(this._alertsPath);
-      const obj = JSON.parse(raw);
-      if (obj && typeof obj === 'object') {
-        for (const [id, a] of Object.entries(obj)) {
-          this._alerts.set(id, a);
-        }
-      }
-    } catch (e) {
-      if (e && (e.code === 'ENOENT' || e.message && e.message.includes('ENOENT'))) {
-        // first run
-      } else {
-        console.error('[tracker] failed to load alerts:', e);
-      }
-    }
-  }
-
-  _readFile(p) {
-    return new Promise((res, rej) => {
-      this._fs.readFile(p, 'utf8', (err, data) => err ? rej(err) : res(data));
-    });
-  }
-
-  async getTorrents() {
-    return new Map(this._torrents);
-  }
-  async putTorrent(infoHash, torrent) {
-    this._torrents.set(infoHash, { ...torrent, peers: { ...(torrent.peers || {}) } });
-    this._dirty = true;
-    this._scheduleFlush();
-  }
-  async deleteTorrent(infoHash) {
-    if (this._torrents.delete(infoHash)) {
-      this._dirty = true;
-      this._scheduleFlush();
-    }
-  }
-  async getTrackers() {
-    return new Map(this._trackers);
-  }
-  async putTracker(url, config) {
-    this._trackers.set(url, { ...config, url });
-    this._dirty = true;
-    this._scheduleFlush();
-  }
-  async deleteTracker(url) {
-    if (this._trackers.delete(url)) {
-      this._dirty = true;
-      this._scheduleFlush();
-    }
-  }
-  async getAlerts() {
-    return new Map(this._alerts);
-  }
-  async putAlert(id, config) {
-    this._alerts.set(id, { ...config, id, updatedAt: Date.now() });
-    this._dirty = true;
-    this._scheduleFlush();
-  }
-  async deleteAlert(id) {
-    if (this._alerts.delete(id)) {
-      this._dirty = true;
-      this._scheduleFlush();
-    }
-  }
-
-  _scheduleFlush() {
-    if (this._flushTimer) return;
-    this._flushTimer = setTimeout(() => this.flush(), 1000);
-    if (this._flushTimer.unref) this._flushTimer.unref();
-  }
-
-  async flush() {
-    if (!this._dirty) return;
-    this._dirty = false;
-    this._flushTimer = null;
-    const fs = this._fs;
-    const dir = this._path.dirname(this._torrentsPath);
-    try { fs.promises ? await fs.promises.mkdir(dir, { recursive: true }) : await this._mkdir(dir); } catch {}
-    const torrentsObj = {};
-    for (const [ih, t] of this._torrents) torrentsObj[ih] = t;
-    const trackersObj = {};
-    for (const [url, c] of this._trackers) trackersObj[url] = c;
-    const alertsObj = {};
-    for (const [id, a] of this._alerts) alertsObj[id] = a;
-    const write = (p, obj) => fs.promises
-      ? fs.promises.writeFile(p, JSON.stringify(obj), 'utf8')
-      : new Promise((res, rej) => this._fs.writeFile(p, JSON.stringify(obj), 'utf8', err => err ? rej(err) : res()));
-    await write(this._torrentsPath, torrentsObj);
-    await write(this._trackersPath, trackersObj);
-    await write(this._alertsPath, alertsObj);
-  }
-
-  async _mkdir(p) {
-    return new Promise((res, rej) => this._fs.mkdir(p, { recursive: true }, err => err ? rej(err) : res()));
-  }
-
-  async close() {
-    if (this._flushTimer) { clearTimeout(this._flushTimer); this._flushTimer = null; }
-    await this.flush();
   }
 }
 
@@ -296,7 +136,7 @@ export class KvStore extends Store {
 
   async getTorrents() {
     const map = new Map();
-    // KV has no list-by-prefix in Workers without KV list; we list the namespace
+    if (!this._torrentsNS) return map;
     const list = await this._torrentsNS.list({ prefix: this._prefix });
     for (const key of list.keys) {
       const raw = await this._torrentsNS.get(key.name);
@@ -317,6 +157,7 @@ export class KvStore extends Store {
   }
   async getTrackers() {
     const map = new Map();
+    if (!this._trackersNS) return map;
     const list = await this._trackersNS.list({ prefix: this._prefix });
     for (const key of list.keys) {
       const raw = await this._trackersNS.get(key.name);
@@ -330,6 +171,16 @@ export class KvStore extends Store {
   }
   async deleteTracker(url) {
     await this._trackersNS.delete(this._k(url));
+  }
+  async touchTracker(url) {
+    if (!this._trackersNS) return;
+    const raw = await this._trackersNS.get(this._k(url));
+    if (!raw) return;
+    try {
+      const cfg = JSON.parse(raw);
+      cfg.lastUsedAt = Date.now();
+      await this._trackersNS.put(this._k(url), JSON.stringify(cfg));
+    } catch {}
   }
   async getAlerts() {
     const map = new Map();
