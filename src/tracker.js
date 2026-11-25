@@ -335,29 +335,55 @@ export class Tracker {
     await this._store.putTracker(url, cfg);
     return { ok: true };
   }
-  /* List trackers with their current usage status (last used today?) */
-  async getTrackerLinks() {
+  /*
+   * List external trackers with their usage status.
+   *
+   * options:
+   *   includeDisabled - also return trackers with enabled === false
+   *   date            - "YYYY-MM-DD" to evaluate usage on that day (default: today)
+   *
+   * The `usedToday` field means "was this tracker used on the evaluated day"
+   * and stays named usedToday for dashboard backward compatibility.
+   */
+  async getTrackerLinks({ includeDisabled = false, date = null } = {}) {
+    let dayStart;
+    if (date) {
+      if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        return { ok: false, error: 'invalid date, expected YYYY-MM-DD' };
+      }
+      const [y, m, d] = date.split('-').map(Number);
+      const parsed = new Date(y, m - 1, d, 0, 0, 0, 0);
+      if (parsed.getFullYear() !== y || parsed.getMonth() !== m - 1 || parsed.getDate() !== d) {
+        return { ok: false, error: 'invalid date, expected YYYY-MM-DD' };
+      }
+      dayStart = parsed.getTime();
+    } else {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      dayStart = d.getTime();
+    }
+    const dayEnd = dayStart + 24 * 60 * 60 * 1000;
+    const day = new Date(dayStart);
+    const dateLabel = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
+
     const tr = await this._store.getTrackers();
-    const now = Date.now();
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    const todayStartMs = todayStart.getTime();
     const links = [];
     for (const [url, cfg] of tr) {
-      if (!cfg.enabled) continue;
+      if (!cfg.enabled && !includeDisabled) continue;
       const lastUsedAt = cfg.lastUsedAt || 0;
-      const usedToday = lastUsedAt >= todayStartMs;
+      const usedToday = lastUsedAt >= dayStart && lastUsedAt < dayEnd;
       const usedDate = lastUsedAt ? new Date(lastUsedAt) : null;
       links.push({
         url,
-        enabled: cfg.enabled,
+        enabled: !!cfg.enabled,
+        note: cfg.note || '',
         addedAt: cfg.addedAt || 0,
         lastUsedAt,
         usedToday,
         usedDate: usedDate ? usedDate.toISOString() : null
       });
     }
-    return { ok: true, trackers: links };
+    return { ok: true, date: dateLabel, trackers: links };
   }
 
   /* ----------------------- admin: import / export ----------------------- */

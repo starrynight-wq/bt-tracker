@@ -62,6 +62,22 @@
   .kv-badge { font-family: ui-monospace, monospace; font-size: 11px; background: #f3f4f6; padding: 2px 6px; border-radius: 6px; color: #374151; }
   .truncated { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .loading { color: #6b7280; font-size: 13px; }
+  /* 表格在窄屏时可横向滚动 */
+  #trackerList, #trackerTodayList, #torrentList, #alertList { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  #trackerList table, #trackerTodayList table, #torrentList table, #alertList table { min-width: 100%; }
+  @media (max-width: 720px) {
+    .container { padding: 12px; }
+    header { flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+    .section, .card { padding: 14px; border-radius: 10px; }
+    .grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+    .big { font-size: 26px; }
+    table { font-size: 12px; }
+    th, td { padding: 8px 6px; }
+    .form-row { grid-template-columns: 1fr; align-items: stretch; }
+    .hash { max-width: 120px; }
+    #trackerList table, #trackerTodayList table { min-width: 640px; }
+    #torrentList table { min-width: 560px; }
+  }
 </style>
 </head>
 <body>
@@ -203,33 +219,28 @@ async function loadStats() {
 
 async function loadTrackers() {
   try {
-    const [all, links] = await Promise.all([
-      api('/admin/trackers'),
-      api('/admin/tracker-links')
-    ]);
+    const r = await api('/admin/tracker-links?enabled=all');
     const el = document.getElementById('trackerList');
-    const trs = all.trackers || [];
-    const usage = new Map((links.trackers || []).map(t => [t.url, t]));
+    const trs = r.trackers || [];
     if (trs.length === 0) { el.innerHTML = '<div class="empty">暂无外部 tracker，添加一个以上联邦同步 peer。</div>'; return; }
     const enabledCount = trs.filter(t => t.enabled).length;
-    const usedCount = trs.filter(t => usage.get(t.url) && usage.get(t.url).usedToday).length;
+    const usedCount = trs.filter(t => t.enabled && t.usedToday).length;
     let html = `<div class="tracker-summary">今日已使用 <b class="status-good">${usedCount}</b> / ${enabledCount} 个已启用的外部 tracker</div>`;
     html += '<table><thead><tr><th>URL</th><th>备注</th><th>状态</th><th>今日使用</th><th>最后使用</th><th>添加时间</th><th>操作</th></tr></thead><tbody>';
     for (const tr of trs) {
-      const u = usage.get(tr.url);
       const enabledCls = tr.enabled ? 'badge-ok' : 'badge-bad';
       const enabledTxt = tr.enabled ? '启用' : '禁用';
       const urlDisplay = tr.url.length > 70 ? tr.url.slice(0, 67) + '...' : tr.url;
       const todayBadge = !tr.enabled
         ? '<span class="badge badge-warn">—</span>'
-        : (u && u.usedToday
+        : (tr.usedToday
           ? '<span class="badge badge-ok">✅ 已使用</span>'
           : '<span class="badge badge-bad">❌ 未使用</span>');
-      const lastUsedStr = u && u.lastUsedAt ? new Date(u.lastUsedAt).toLocaleString() : '-';
-      const addedStr = (u && u.addedAt) || tr.addedAt ? new Date((u && u.addedAt) || tr.addedAt).toLocaleString() : '-';
+      const lastUsedStr = tr.lastUsedAt ? new Date(tr.lastUsedAt).toLocaleString() : '-';
+      const addedStr = tr.addedAt ? new Date(tr.addedAt).toLocaleString() : '-';
       html += `<tr>
         <td><span class="hash" title="${tr.url}">${urlDisplay}</span></td>
-        <td>${tr.note || '-'}</td>
+        <td>${tr.note ? escapeHtml(tr.note) : '-'}</td>
         <td><span class="badge ${enabledCls}">${enabledTxt}</span></td>
         <td>${todayBadge}</td>
         <td class="muted">${lastUsedStr}</td>
@@ -254,9 +265,12 @@ async function loadTodayTrackers() {
     const r = await api('/admin/tracker-links');
     const used = (r.trackers || []).filter(t => t.usedToday);
     const updated = document.getElementById('trackerTodayUpdated');
-    if (updated) updated.textContent = '更新于 ' + new Date().toLocaleTimeString();
+    const now = new Date();
+    if (updated) {
+      updated.textContent = (r.date || now.toLocaleDateString()) + ' · 更新于 ' + now.toLocaleTimeString();
+    }
     if (used.length === 0) {
-      el.innerHTML = '<div class="empty">今天还没有使用过任何外部 tracker。</div>';
+      el.innerHTML = '<div class="empty">今天还没有使用过任何外部 tracker。<br><span class="muted">当客户端 announce 且成功合并上游 peer 后，这里会自动出现。</span></div>';
       return;
     }
     used.sort((a, b) => b.lastUsedAt - a.lastUsedAt);

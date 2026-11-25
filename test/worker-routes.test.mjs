@@ -80,4 +80,38 @@ for (const [name, impl] of [['worker.js', worker], ['worker-bundle.js', bundle]]
     assert.equal(data.trackers[0].usedToday, false);
     assert.equal(data.trackers[0].lastUsedAt, 0);
   });
+
+  test(`${name}: /admin/tracker-links supports enabled=all and date=`, async () => {
+    const env = makeEnv();
+    const add = (url, enabled) => impl.fetch(request('https://tracker.test/admin/trackers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, enabled })
+    }), env);
+    await add('http://a.example/announce', true);
+    await add('http://b.example/announce', false);
+
+    // default: only enabled trackers
+    let data = await json(await impl.fetch(request('https://tracker.test/admin/tracker-links'), env));
+    assert.equal(data.trackers.length, 1);
+    assert.equal(data.trackers[0].url, 'http://a.example/announce');
+
+    // enabled=all: include disabled trackers
+    data = await json(await impl.fetch(request('https://tracker.test/admin/tracker-links?enabled=all'), env));
+    assert.equal(data.trackers.length, 2);
+    assert.equal(data.trackers.some((t) => t.enabled === false), true);
+
+    // date: evaluate usedToday on a specific day
+    data = await json(await impl.fetch(request('https://tracker.test/admin/tracker-links?date=2000-01-01'), env));
+    assert.equal(data.ok, true);
+    assert.equal(data.date, '2000-01-01');
+    assert.equal(data.trackers.every((t) => t.usedToday === false), true);
+
+    // invalid date -> 400
+    const bad = await impl.fetch(request('https://tracker.test/admin/tracker-links?date=2000-13-01'), env);
+    assert.equal(bad.status, 400);
+    const badBody = await bad.json();
+    assert.equal(badBody.ok, false);
+    assert.equal(badBody.error, 'invalid date, expected YYYY-MM-DD');
+  });
 }

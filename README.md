@@ -406,13 +406,22 @@ d8:completei<数量>e10:incompletei<数量>e8:intervali<秒数>e12:min intervali
 
 #### `/admin/tracker-links` 响应
 
+查询参数：
+
+| 参数 | 说明 |
+|------|------|
+| `enabled=all` | 同时返回已禁用的 tracker（默认只返回启用的） |
+| `date=YYYY-MM-DD` | 按指定日期统计 `usedToday`（默认今天，按服务器本地时区零点计算） |
+
 ```json
 {
   "ok": true,
+  "date": "2026-11-25",
   "trackers": [
     {
       "url": "http://tracker.example.com:6969/announce",
       "enabled": true,
+      "note": "公共上游",
       "addedAt": 1700000000000,
       "lastUsedAt": 1700003600000,
       "usedToday": true,
@@ -422,9 +431,11 @@ d8:completei<数量>e10:incompletei<数量>e8:intervali<秒数>e12:min intervali
 }
 ```
 
-- 只返回 `enabled: true` 的 tracker。
+- 默认只返回 `enabled: true` 的 tracker；`?enabled=all` 返回全部。
 - `lastUsedAt`：最近一次成功向上游 tracker 发起请求的时间（毫秒时间戳，0 表示从未使用）。
-- `usedToday`：`lastUsedAt` 是否在当前服务器本地时间的“今天”内（Workers 环境为 UTC）。
+- `usedToday`：`lastUsedAt` 是否落在「统计日」区间内（统计日默认为今天；`?date=` 可指定）。
+- `date`：本次统计使用的日期标签（`YYYY-MM-DD`）。
+- 非法 `date`（不是 `YYYY-MM-DD` 或日期不存在）返回 HTTP 400 与 `{ "ok": false, "error": "invalid date, expected YYYY-MM-DD" }`。
 - 每次成功的上游 announce 合并都会调用 `touchTracker` 更新该字段。
 
 #### 提醒规则字段
@@ -491,6 +502,26 @@ curl -X POST http://你的-tracker/admin/import -H 'Content-Type: application/js
 3. 解码上游返回的 bencode 响应，提取 compact peer 列表；
 4. 按 `ip:port` 去重，与本地 peer 合并；
 5. 按 `numwant` 截断后返回给客户端。
+
+### 外部 tracker 使用统计（今日使用）
+
+面板中的「📅 今日使用的外部 Tracker」不是靠定时探测，而是记录**真实使用**：
+
+1. 每个外部 tracker 配置里新增 `lastUsedAt`（毫秒时间戳，默认 0 = 从未使用）。
+2. `/announce` 合并上游时，只要某个启用 tracker 的 announce 成功返回（`res.ok`），就调用
+   `store.touchTracker(url)` 把它的 `lastUsedAt` 更新为当前时间；失败的上游不会更新。
+3. `GET /admin/tracker-links` 读取所有 tracker，并将 `lastUsedAt` 与「统计日」的
+   00:00:00–24:00:00 区间比较，得到 `usedToday`（统计日可用 `?date=YYYY-MM-DD` 指定，
+   默认今天）。
+4. dashboard 每 30 秒调用一次该接口：只显示 `usedToday === true` 的 tracker，并显示最后使用
+   时间；管理表格则通过 `?enabled=all` 拿到全部 tracker（含禁用项）及其今日状态。
+
+「今天」的范围按**服务器本地时区**计算（Node 服务器使用系统时区；Cloudflare Workers 运行时为
+UTC）。因此 Workers/Pages 部署下统计日以 UTC 零点切换；如需按其他时区统计，可传
+`?date=YYYY-MM-DD` 按该日（服务器本地时间）计算。
+
+存储层：`MemoryStore` / `FileStore` / `KvStore` 都实现了 `touchTracker`，其中 FileStore 会把
+变更标记为 dirty 并触发刷盘，KvStore 直接回写对应 KV 键。
 
 ### 用量提醒
 

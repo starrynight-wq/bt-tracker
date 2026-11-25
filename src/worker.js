@@ -171,7 +171,9 @@ async function adminHandler(request, tracker, url) {
     // external tracker usage list (dashboard "today" view)
     if (path === '/admin/tracker-links') {
       if (method !== 'GET') return json({ ok: false, error: 'method not allowed' }, 405);
-      return json(await tracker.getTrackerLinks());
+      const includeDisabled = query.enabled === 'all';
+      const r = await tracker.getTrackerLinks({ includeDisabled, date: query.date || null });
+      return json(r, r.ok ? 200 : 400);
     }
     return json({ ok: false, error: 'not found' }, 404);
   } catch (e) {

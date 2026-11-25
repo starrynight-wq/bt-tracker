@@ -85,6 +85,17 @@ try {
   links = await (await fetch(`${BASE}/admin/tracker-links`)).json();
   assert.equal(links.trackers[0].usedToday, true, 'tracker should be marked as used today');
   assert.ok(links.trackers[0].lastUsedAt > 0, 'lastUsedAt should be set');
+  assert.equal(typeof links.date, 'string');
+
+  /* enabled=all and date filtering */
+  const all = await (await fetch(`${BASE}/admin/tracker-links?enabled=all`)).json();
+  assert.equal(all.trackers.length, 1);
+  const past = await (await fetch(`${BASE}/admin/tracker-links?date=2000-01-01`)).json();
+  assert.equal(past.ok, true);
+  assert.equal(past.date, '2000-01-01');
+  assert.equal(past.trackers[0].usedToday, false);
+  const badDate = await fetch(`${BASE}/admin/tracker-links?date=2000-13-01`);
+  assert.equal(badDate.status, 400);
 
   /* stats reflect the usage */
   const stats = await (await fetch(`${BASE}/stats`)).json();
@@ -92,7 +103,7 @@ try {
   assert.equal(stats.trackers, 1);
   assert.ok(stats.stats.announces >= 1);
 
-  console.log('[smoke] OK: announce -> upstream fetched -> tracker-links usedToday=true');
+  console.log('[smoke] OK: announce -> upstream fetched -> tracker-links usedToday=true (date/enabled filters ok)');
   cleanup(0);
 } catch (e) {
   console.error('[smoke] FAILED:', e);

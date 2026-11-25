@@ -200,8 +200,9 @@ const server = createServer(async (req, res) => {
     }
 
     if (path === '/admin/tracker-links') {
-      const r = await tracker.getTrackerLinks();
-      send(200, JSON.stringify(r), 'application/json');
+      const includeDisabled = query.enabled === 'all';
+      const r = await tracker.getTrackerLinks({ includeDisabled, date: query.date || null });
+      send(r.ok ? 200 : 400, JSON.stringify(r), 'application/json');
       return;
     }
 

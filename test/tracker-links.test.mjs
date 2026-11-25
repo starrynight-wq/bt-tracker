@@ -87,6 +87,57 @@ test('a failed external fetch does not mark the tracker as used', async () => {
   assert.equal(links.trackers[0].lastUsedAt, 0);
 });
 
+test('getTrackerLinks({ includeDisabled: true }) returns disabled trackers too', async () => {
+  const store = new MemoryStore();
+  const tracker = makeTracker({ store, externalFetch: async () => ({ ok: false }) });
+  await tracker.addTracker('http://enabled.example/announce', true, 'on');
+  await tracker.addTracker('http://disabled.example/announce', false, 'off');
+
+  const links = await tracker.getTrackerLinks({ includeDisabled: true });
+  assert.equal(links.trackers.length, 2);
+  const byUrl = new Map(links.trackers.map((t) => [t.url, t]));
+  assert.equal(byUrl.get('http://enabled.example/announce').note, 'on');
+  assert.equal(byUrl.get('http://disabled.example/announce').enabled, false);
+  assert.equal(byUrl.get('http://disabled.example/announce').note, 'off');
+});
+
+test('getTrackerLinks({ date }) evaluates usedToday on the requested day', async () => {
+  const store = new MemoryStore();
+  const tracker = makeTracker({ store, externalFetch: async () => ({ ok: true, peers: [] }) });
+  await tracker.addTracker('http://up.example/announce', true);
+
+  await tracker.handleRequest({ url: announceUrl() });
+
+  const today = (await tracker.getTrackerLinks()).date;
+  const onToday = await tracker.getTrackerLinks({ date: today });
+  assert.equal(onToday.ok, true);
+  assert.equal(onToday.date, today);
+  assert.equal(onToday.trackers[0].usedToday, true);
+
+  const yesterday = shiftDate(today, -1);
+  const onYesterday = await tracker.getTrackerLinks({ date: yesterday });
+  assert.equal(onYesterday.ok, true);
+  assert.equal(onYesterday.date, yesterday);
+  assert.equal(onYesterday.trackers[0].usedToday, false);
+});
+
+test('getTrackerLinks rejects an invalid date', async () => {
+  const store = new MemoryStore();
+  const tracker = makeTracker({ store, externalFetch: async () => ({ ok: false }) });
+
+  for (const bad of ['2026-13-01', '2026-02-30', '20261125', 'abc']) {
+    const r = await tracker.getTrackerLinks({ date: bad });
+    assert.equal(r.ok, false, `date ${bad} should be rejected`);
+    assert.equal(r.error, 'invalid date, expected YYYY-MM-DD');
+  }
+});
+
+function shiftDate(yyyyMmDd, days) {
+  const [y, m, d] = yyyyMmDd.split('-').map(Number);
+  const dt = new Date(y, m - 1, d + days);
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+}
+
 function startOfToday() {
   const d = new Date();
   d.setHours(0, 0, 0, 0);
