@@ -3,11 +3,15 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { FileStore } from './file-store.js';
 import { Tracker } from './tracker.js';
+import { createNodeAdapter } from './adapters/node.js';
 
 const PORT = Number(process.env.PORT || 3000);
 const INTERVAL = Number(process.env.TRACKER_INTERVAL || 1800);
 const MIN_INTERVAL = Number(process.env.TRACKER_MIN_INTERVAL || 900);
 const TRACKER_ID = process.env.TRACKER_ID || 'bt-tracker';
+const ANNOUNCE_BUDGET_MS = Number(process.env.TRACKER_ANNOUNCE_BUDGET_MS || 8000);
+const UPSTREAM_CONCURRENCY = Number(process.env.TRACKER_UPSTREAM_CONCURRENCY || 24);
+const UPSTREAM_TIMEOUT_MS = Number(process.env.TRACKER_UPSTREAM_TIMEOUT_MS || 3000);
 
 const store = new FileStore({
   torrentsPath: process.env.TORRENTS_PATH,
@@ -20,53 +24,13 @@ const tracker = new Tracker({
   interval: INTERVAL,
   minInterval: MIN_INTERVAL,
   trackerId: TRACKER_ID,
-  /* External tracker fetcher for Node/Replit */
-  externalFetch: async (url, params) => {
-    try {
-      const u = new URL(url);
-      for (const [k, v] of Object.entries(params)) {
-        if (v === undefined) continue;
-        u.searchParams.set(k, String(v));
-      }
-      const res = await fetch(u.toString(), {
-        method: 'GET',
-        headers: { 'User-Agent': 'bt-tracker/1.0' },
-        // fail fast on dead external trackers
-        signal: AbortSignal.timeout(8000)
-      });
-      if (!res.ok) return { ok: false };
-      const body = new Uint8Array(await res.arrayBuffer());
-      // decode bencode
-      const { decodeSync } = await import('./bencode.js');
-      const decoded = decodeSync(body);
-      if (!decoded || typeof decoded !== 'object') return { ok: false };
-
-      const peers = [];
-      const p = decoded.peers;
-      if (Array.isArray(p)) {
-        for (const item of p) {
-          if (item && item.ip && item.port !== undefined) {
-            peers.push({ ip: item.ip, port: Number(item.port), peerId: item.peer_id || '' });
-          }
-        }
-      } else if (p instanceof Uint8Array) {
-        // compact peers: 6 bytes per peer
-        for (let i = 0; i + 5 < p.length; i += 6) {
-          const ip = [p[i], p[i+1], p[i+2], p[i+3]].join('.');
-          const port = (p[i+4] << 8) | p[i+5];
-          peers.push({ ip, port, peerId: 'ext' });
-        }
-      }
-      return {
-        ok: true,
-        peers,
-        complete: decoded.complete,
-        incomplete: decoded.incomplete
-      };
-    } catch (e) {
-      return { ok: false };
-    }
-  }
+  budgetMs: ANNOUNCE_BUDGET_MS,
+  /* Upstream aggregation adapter for Node/Replit (bounded concurrency,
+   * per-request timeouts, udp:// skipped). Same tracker core as Workers. */
+  adapter: createNodeAdapter({
+    concurrency: UPSTREAM_CONCURRENCY,
+    perRequestTimeoutMs: UPSTREAM_TIMEOUT_MS
+  })
 });
 
 async function init() {
@@ -117,9 +81,12 @@ const server = createServer(async (req, res) => {
     if (path === '/announce' || path === '/scrape' || path === '/stats') {
       // Build a Request-like object for tracker.handleRequest
       const fakeReq = { url: url.toString() };
-      const response = await tracker.handleRequest(fakeReq);
-      const text = await response.text();
-      send(response.status, text, response.headers.get('content-type') || 'text/plain');
+      const response = await tracker.handleRequest(fakeReq, { budgetMs: ANNOUNCE_BUDGET_MS });
+      // Keep the body as raw bytes: announce responses are bencoded and may
+      // contain arbitrary binary peer data (compact peers), so decoding to a
+      // JS string would corrupt it.
+      const payload = Buffer.from(await response.arrayBuffer());
+      send(response.status, payload, response.headers.get('content-type') || 'text/plain');
       return;
     }
 

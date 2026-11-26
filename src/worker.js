@@ -13,74 +13,44 @@
  *   BT_INTERVAL                          - announce interval seconds (default 1800)
  *   BT_MIN_INTERVAL                      - minimum announce interval (default 900)
  *   BT_TRACKER_ID                        - tracker id string
+ *   BT_ANNOUNCE_BUDGET_MS                - upstream aggregation budget (default 8000)
+ *   BT_UPSTREAM_TIMEOUT_MS               - per-upstream fetch timeout (default 2500)
+ *
+ * Upstream aggregation uses the Cloudflare adapter (src/adapters/cloudflare.js),
+ * which enforces the free-plan subrequest/connection limits and never touches
+ * udp:// trackers. This project is not a general-purpose proxy: it only
+ * aggregates BitTorrent tracker announce responses.
  */
 
 import { KvStore } from './store.js';
 import { Tracker } from './tracker.js';
-import { decodeSync } from './bencode.js';
+import { createCloudflareAdapter } from './adapters/cloudflare.js';
 import { DASHBOARD_HTML } from './dashboard-html.js';
 
 const ENV_DEFAULT_INTERVAL = 1800;
 const ENV_DEFAULT_MIN_INTERVAL = 900;
 const ENV_DEFAULT_TRACKER_ID = 'bt-tracker';
+const ENV_DEFAULT_BUDGET_MS = 8000;
+const ENV_DEFAULT_UPSTREAM_TIMEOUT_MS = 2500;
 
 function makeStore(torrentsNs, trackersNs, alertsNs) {
   return new KvStore({ torrentsNamespace: torrentsNs, trackersNamespace: trackersNs, alertsNamespace: alertsNs });
-}
-
-/* External tracker fetcher for Cloudflare Workers (uses the global fetch) */
-async function externalFetch(url, params) {
-  try {
-    const u = new URL(url);
-    for (const [k, v] of Object.entries(params)) {
-      if (v === undefined) continue;
-      u.searchParams.set(k, String(v));
-    }
-    const res = await fetch(u.toString(), {
-      method: 'GET',
-      headers: { 'User-Agent': 'bt-tracker/1.0' }
-    });
-    if (!res.ok) return { ok: false };
-    const body = new Uint8Array(await res.arrayBuffer());
-    const decoded = decodeSync(body);
-    if (!decoded || typeof decoded !== 'object') return { ok: false };
-
-    const peers = [];
-    const p = decoded.peers;
-    if (Array.isArray(p)) {
-      for (const item of p) {
-        if (item && item.ip && item.port !== undefined) {
-          peers.push({ ip: item.ip, port: Number(item.port), peerId: item.peer_id || '' });
-        }
-      }
-    } else if (p instanceof Uint8Array) {
-      for (let i = 0; i + 5 < p.length; i += 6) {
-        const ip = [p[i], p[i + 1], p[i + 2], p[i + 3]].join('.');
-        const port = (p[i + 4] << 8) | p[i + 5];
-        peers.push({ ip, port, peerId: 'ext' });
-      }
-    }
-    return {
-      ok: true,
-      peers,
-      complete: decoded.complete,
-      incomplete: decoded.incomplete
-    };
-  } catch (e) {
-    return { ok: false };
-  }
 }
 
 export default {
   async fetch(request, env) {
     env = env || {};
     const store = makeStore(env.BT_TORRENTS, env.BT_TRACKERS, env.BT_ALERTS);
+    const budgetMs = Number(env.BT_ANNOUNCE_BUDGET_MS || ENV_DEFAULT_BUDGET_MS);
     const tracker = new Tracker({
       store,
       interval: Number(env.BT_INTERVAL || ENV_DEFAULT_INTERVAL),
       minInterval: Number(env.BT_MIN_INTERVAL || ENV_DEFAULT_MIN_INTERVAL),
       trackerId: env.BT_TRACKER_ID || ENV_DEFAULT_TRACKER_ID,
-      externalFetch
+      budgetMs,
+      adapter: createCloudflareAdapter({
+        perRequestTimeoutMs: Number(env.BT_UPSTREAM_TIMEOUT_MS || ENV_DEFAULT_UPSTREAM_TIMEOUT_MS)
+      })
     });
 
     const url = new URL(request.url);
@@ -98,7 +68,7 @@ export default {
 
     // tracker endpoints
     if (path === '/announce' || path === '/scrape' || path === '/stats') {
-      return tracker.handleRequest(request);
+      return tracker.handleRequest(request, { budgetMs });
     }
 
     // admin endpoints

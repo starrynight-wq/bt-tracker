@@ -3,7 +3,8 @@
 /*
  * BitTorrent tracker core (HTTP/HTTPS announce + scrape).
  *
- * Works in Node.js (Replit) and Cloudflare Workers.
+ * Works in Node.js (Replit) and Cloudflare Workers/Pages: platform-specific
+ * transport details live behind an injected adapter (src/adapters/*.js).
  *
  * Announce request query parameters (standard):
  *   info_hash (20 bytes), peer_id (20 bytes), ip, port,
@@ -19,6 +20,33 @@
  *     tracker id: <str>    (optional)
  *     peers: <compact bytes> or <list of dicts>
  *   e
+ *
+ * ---------------------------------------------------------------------------
+ * AGGREGATION AUDIT (2026-11-26, before this refactor):
+ *   1. Upstream querying was SERIAL: `for (const [url, cfg] of trackers)` with
+ *      `await this._fetchExternal(url, ...)` inside the loop. One dead upstream
+ *      delayed every later upstream, so N dead trackers could take N × timeout.
+ *   2. worker.js `externalFetch` had NO AbortSignal.timeout at all (the Node
+ *      server used 8 s per request, but serially). A hanging fetch could hang
+ *      the whole announce.
+ *   3. store.js had no per-infohash aggregation state: torrent records only
+ *      carried peers/completed. `pendingUpstreams` and `bootstrapUntil` are now
+ *      persisted on the torrent record (still keyed by infohash via
+ *      getTorrents/putTorrent, so all three store backends support it).
+ *   4. DEFAULT_INTERVAL was 1800 s, DEFAULT_MIN_INTERVAL was 900 s.
+ *
+ * Aggregation is now BUDGET-DRIVEN: announce() gives the adapter a batch of
+ * upstream URLs plus a wall-clock budget (default 8000 ms, leaving ~2 s of the
+ * client's ~10 s receive timeout). The adapter resolves within the budget using
+ * Promise.allSettled + a bounded connection pool, and returns whatever settled.
+ * URLs not queried in time are stored as pendingUpstreams and retried on the
+ * next announce. While pending upstreams remain, a short bootstrap interval
+ * (120 s) is advertised so the client re-announces soon; once the pending list
+ * is cleared (or the bootstrap window expires) the normal interval is restored.
+ *
+ * NOTE: this project is NOT a general-purpose proxy. It only performs
+ * BitTorrent tracker announce aggregation for its own clients.
+ * ---------------------------------------------------------------------------
  */
 
 import { encode, encodeStr } from './bencode.js';
@@ -30,6 +58,14 @@ const MAX_NUMWANT = 200;
 const DEFAULT_NUMWANT = 50;
 const PEER_TTL_MS = 30 * 60 * 1000; // peers expire after 30 min silence
 const COMPACT_PEER = 6;   // 4 ip + 2 port
+
+/* Budget-driven aggregation (see header). */
+const DEFAULT_BUDGET_MS = 8000;          // client receive timeout ~10 s -> 2 s margin
+const BOOTSTRAP_INTERVAL = 120;          // seconds, only while upstream results are incomplete
+const BOOTSTRAP_WINDOW_FACTOR = 5;       // bootstrapUntil = now + 5 * BOOTSTRAP_INTERVAL
+const MAX_PENDING_UPSTREAMS = 200;       // cap persisted pending list size
+const MIN_BUDGET_MS = 250;
+const MAX_BUDGET_MS = 30000;
 
 function isCompact(val) {
   // compact=1 means compact peer list
@@ -104,30 +140,33 @@ function peersToCompact(peers) {
 /*
  * Tracker class. One instance per runtime.
  * store: Store instance
- * externalFetch: (url, params) => Promise<{ok, peers?: [], complete?, incomplete?}>  (injected)
- * options: { interval, minInterval, trackerId }
+ * adapter: { fetchPeersBatch(infoHash, peerParams, upstreamUrls, budgetMs) } (injected)
+ *   Node: src/adapters/node.js, Cloudflare: src/adapters/cloudflare.js
+ * options: { interval, minInterval, trackerId, budgetMs }
  */
 export class Tracker {
-  constructor({ store, externalFetch, interval = DEFAULT_INTERVAL,
-               minInterval = DEFAULT_MIN_INTERVAL, trackerId = 'bt-tracker' } = {}) {
+  constructor({ store, adapter, interval = DEFAULT_INTERVAL,
+               minInterval = DEFAULT_MIN_INTERVAL, trackerId = 'bt-tracker',
+               budgetMs = DEFAULT_BUDGET_MS } = {}) {
     this._store = store;
-    this._externalFetch = externalFetch;
+    this._adapter = adapter || null;
     this._interval = interval;
     this._minInterval = minInterval;
     this._trackerId = trackerId;
+    this._budgetMs = Math.min(Math.max(Number(budgetMs) || DEFAULT_BUDGET_MS, MIN_BUDGET_MS), MAX_BUDGET_MS);
     this._stats = { announces: 0, scrapes: 0, errors: 0, startedAt: Date.now() };
   }
 
   /* ----------------------- public API ----------------------- */
 
-  async handleRequest(req) {
+  async handleRequest(req, options = {}) {
     const url = new URL(req.url);
     const path = url.pathname;
     const query = {};
     for (const [k, v] of url.searchParams) query[k] = v;
 
     if (path === '/announce' || path === '/announce/') {
-      return this.announce(query);
+      return this.announce(query, options);
     }
     if (path === '/scrape' || path === '/scrape/') {
       return this.scrape(query);
@@ -140,9 +179,20 @@ export class Tracker {
 
   /* ----------------------- announce ----------------------- */
 
-  async announce(query) {
+  /*
+   * Announce.
+   *
+   * budgetMs is the wall-clock budget for upstream aggregation. The adapter is
+   * expected to honour it; a defensive race here guarantees we still answer
+   * with a valid bencoded response (possibly empty peers) if it does not.
+   */
+  async announce(query, options = {}) {
     this._stats.announces++;
     try {
+      const budgetMs = Math.min(
+        Math.max(Number(options.budgetMs) || this._budgetMs, MIN_BUDGET_MS),
+        MAX_BUDGET_MS
+      );
       const infoHashRaw = query.info_hash;
       const peerId = query.peer_id || '';
       const ip = query.ip || '';
@@ -167,9 +217,8 @@ export class Tracker {
       }
 
       const isCompleted = event === 'completed';
-      const isStarted = event === 'started';
 
-      // upsert peer
+      // upsert peer + read aggregation state in one read (one putTorrent below)
       const peer = {
         peerId,
         ip: ip || '0.0.0.0',
@@ -180,52 +229,51 @@ export class Tracker {
         event,
         lastAnnounce: Date.now()
       };
-      const torrent = await this._upsertPeer(infoHash, peer, isCompleted);
+      const now = Date.now();
+      const torrents = await this._store.getTorrents();
+      const torrent = this._applyPeer(torrents, infoHash, peer, isCompleted);
 
       // gather local peers (exclude self, only interested peers with left > 0 unless completed)
       const peers = this._selectPeers(torrent, peerId, numwant, compact);
 
-      // fetch from external trackers and merge
-      let extPeers = [];
-      let extComplete = 0;
-      let extIncomplete = 0;
-      const trackers = await this._store.getTrackers();
-      for (const [url, cfg] of trackers) {
-        if (!cfg.enabled) continue;
-        try {
-          const res = await this._fetchExternal(url, {
-            info_hash: infoHashRaw,
-            peer_id: peerId,
-            ip, port, uploaded, downloaded, left,
-            event, compact: 1, numwant
-          });
-          if (res.ok) {
-            extPeers = extPeers.concat(res.peers || []);
-            if (res.complete !== undefined) extComplete += res.complete;
-            if (res.incomplete !== undefined) extIncomplete += res.incomplete;
-            // mark this tracker as used today
-            try { await this._store.touchTracker(url); } catch (e) { console.error('[tracker] touchTracker failed', url, e); }
-          }
-        } catch (e) {
-          console.error('[tracker] external tracker error', url, e);
-        }
+      /*
+       * Budget-driven upstream aggregation (one adapter call per announce).
+       * The adapter owns platform limits: Cloudflare caps this batch at 40
+       * upstreams and returns the rest as pendingUrls; Node keeps a bounded
+       * connection pool. Unqueried URLs are persisted and retried on the next
+       * announce.
+       */
+      const plannedUrls = await this._collectUpstreamPlan(torrent);
+      let batch = { results: [], pendingUrls: [] };
+      if (this._adapter && plannedUrls.length > 0) {
+        batch = await this._runAggregation(infoHash, {
+          info_hash: infoHashRaw,
+          peer_id: peerId,
+          ip, port, uploaded, downloaded, left,
+          event, compact: 1, numwant
+        }, plannedUrls, budgetMs);
       }
 
-      // merge external peers (compact bytes -> parse)
-      const extCompact = peersToCompact(extPeers.map(p => ({ ip: p.ip, port: p.port })));
-      // dedupe by ip:port against local
-      const localSet = new Set();
-      const localPeers = [];
-      for (const p of peers) {
-        const key = p.ip + ':' + p.port;
-        if (!localSet.has(key)) { localSet.add(key); localPeers.push(p); }
+      // collect settled upstream results + mark used trackers
+      const extPeers = [];
+      const usedUrls = [];
+      let extComplete = 0;
+      let extIncomplete = 0;
+      for (const r of batch.results) {
+        if (!r || r.ok !== true) continue;
+        usedUrls.push(r.url);
+        for (const p of r.peers || []) {
+          if (p && p.ip) extPeers.push({ ip: p.ip, port: Number(p.port) || 0 });
+        }
+        extComplete += Number(r.complete) || 0;
+        extIncomplete += Number(r.incomplete) || 0;
       }
-      const merged = [...localPeers];
-      for (const p of extPeers) {
-        const key = p.ip + ':' + p.port;
-        if (!localSet.has(key)) { localSet.add(key); merged.push({ ip: p.ip, port: p.port, peerId: 'ext' }); }
+      if (usedUrls.length > 0) {
+        try { await this._store.touchTrackers(usedUrls); } catch (e) { console.error('[tracker] touchTrackers failed', e); }
       }
-      if (merged.length > numwant) merged.length = numwant;
+
+      // simple Set<ip:port> de-duplication (cheap for the Workers CPU budget)
+      const merged = this._mergePeers(peers, extPeers, numwant);
 
       // compute counts
       let complete = 0, incomplete = 0;
@@ -235,11 +283,19 @@ export class Tracker {
       complete += extComplete;
       incomplete += extIncomplete;
 
+      // bootstrap state machine: short interval only while results are incomplete
+      const bootstrap = this._bootstrapState(torrent, batch.pendingUrls, now);
+      torrent.pendingUpstreams = bootstrap.pendingUpstreams;
+      torrent.bootstrapUntil = bootstrap.bootstrapUntil;
+      torrent.updatedAt = now;
+      await this._store.putTorrent(infoHash, torrent);
+
       const peersBody = compact ? peersToCompact(merged) : merged;
       // fire-and-forget alert evaluation (does not block the response)
       this.checkAlerts().catch(() => {});
       return this._bencodeOk({
-        complete, incomplete, interval: this._interval, minInterval: this._minInterval,
+        complete, incomplete,
+        interval: bootstrap.interval, minInterval: bootstrap.minInterval,
         peers: peersBody
       });
     } catch (e) {
@@ -532,25 +588,156 @@ export class Tracker {
 
   /* ----------------------- internals ----------------------- */
 
-  async _upsertPeer(infoHash, peer, isCompleted) {
-    const t = await this._store.getTorrents();
-    let tor = t.get(infoHash);
+  /*
+   * Apply the announcing peer to the in-memory torrent record.
+   * The record is persisted once, after aggregation, together with the
+   * pendingUpstreams/bootstrapUntil state (see announce()).
+   */
+  _applyPeer(torrents, infoHash, peer, isCompleted) {
+    let tor = torrents.get(infoHash);
     if (!tor) {
       tor = { infoHash, createdAt: Date.now(), updatedAt: Date.now(), peers: {}, completed: 0 };
     }
     tor.peers = tor.peers || {};
-    const key = peer.peerId;
-    const existing = tor.peers[key];
-    if (existing) {
-      // update fields
-      tor.peers[key] = { ...existing, ...peer, lastAnnounce: Date.now() };
-    } else {
-      tor.peers[key] = { ...peer, lastAnnounce: Date.now() };
-    }
+    const existing = tor.peers[peer.peerId];
+    tor.peers[peer.peerId] = { ...(existing || {}), ...peer, lastAnnounce: Date.now() };
     if (isCompleted && peer.left === 0) tor.completed = (tor.completed || 0) + 1;
     tor.updatedAt = Date.now();
-    await this._store.putTorrent(infoHash, tor);
     return tor;
+  }
+
+  /*
+   * Build the ordered list of enabled upstream URLs to try this round:
+   * previously-pending URLs first (so partially-answered trackers finish
+   * first), then all remaining enabled trackers.
+   */
+  async _collectUpstreamPlan(torrent) {
+    const trackers = await this._store.getTrackers();
+    const enabled = [];
+    for (const [url, cfg] of trackers) {
+      if (cfg && cfg.enabled) enabled.push(url);
+    }
+    if (enabled.length === 0) return [];
+    const enabledSet = new Set(enabled);
+    const seen = new Set();
+    const plan = [];
+    for (const url of torrent.pendingUpstreams || []) {
+      if (typeof url !== 'string' || !enabledSet.has(url) || seen.has(url)) continue;
+      seen.add(url);
+      plan.push(url);
+    }
+    for (const url of enabled) {
+      if (seen.has(url)) continue;
+      seen.add(url);
+      plan.push(url);
+    }
+    return plan;
+  }
+
+  /*
+   * Run the injected adapter under a hard wall-clock budget.
+   *
+   * The adapter is expected to resolve within budgetMs; the race below is a
+   * defensive guarantee so a buggy/hanging adapter still yields a valid
+   * (possibly empty) announce response. Late adapter results are ignored, and
+   * every unqueried URL is treated as pending for the next announce.
+   */
+  async _runAggregation(infoHash, peerParams, plannedUrls, budgetMs) {
+    let timer;
+    const hardStop = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ results: [], pendingUrls: plannedUrls.slice(), timedOut: true }), budgetMs);
+    });
+    const work = Promise.resolve()
+      .then(() => this._adapter.fetchPeersBatch(infoHash, peerParams, plannedUrls, budgetMs))
+      .catch((e) => {
+        console.error('[tracker] upstream adapter error', e);
+        return { results: [], pendingUrls: plannedUrls.slice() };
+      });
+
+    let batch;
+    try {
+      batch = await Promise.race([work, hardStop]);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const results = [];
+    if (batch && Array.isArray(batch.results)) {
+      for (const r of batch.results) {
+        if (r && typeof r.url === 'string') results.push(r);
+      }
+    }
+    const pendingUrls = batch && Array.isArray(batch.pendingUrls) ? batch.pendingUrls : [];
+    return { results, pendingUrls };
+  }
+
+  /* Simple Set<ip:port> de-duplication; local peers keep priority. */
+  _mergePeers(localPeers, extPeers, numwant) {
+    const seen = new Set();
+    const out = [];
+    const push = (p, peerId) => {
+      if (!p || !p.ip) return true;
+      const key = p.ip + ':' + p.port;
+      if (seen.has(key)) return true;
+      const port = Number(p.port) || 0;
+      if (port < 1 || port > 65535) return true;
+      seen.add(key);
+      out.push({ ip: p.ip, port, peerId });
+      return out.length < numwant;
+    };
+    for (const p of localPeers) {
+      if (!push(p, p.peerId || '')) return out;
+    }
+    for (const p of extPeers) {
+      if (!push(p, 'ext')) return out;
+    }
+    return out;
+  }
+
+  /*
+   * Bootstrap state machine.
+   *
+   * While some upstreams could not be queried within the budget, advertise a
+   * short interval (120 s) and keep the remaining URLs in pendingUpstreams.
+   * The short interval is only used during this incomplete phase:
+   *   - pending cleared          -> normal interval
+   *   - bootstrap window expired -> normal interval, stale pending dropped
+   * The advertised min interval is lowered to the bootstrap interval so the
+   * short interval is compliant for clients (they accept interval >= min
+   * interval). It never stays at 60-120 s long term.
+   */
+  _bootstrapState(torrent, pendingUrls, now) {
+    // sanitize + dedupe persisted pending list
+    const pending = [];
+    const seen = new Set();
+    for (const url of pendingUrls || []) {
+      if (typeof url !== 'string' || url.length === 0 || seen.has(url)) continue;
+      seen.add(url);
+      pending.push(url);
+      if (pending.length >= MAX_PENDING_UPSTREAMS) break;
+    }
+
+    if (pending.length === 0) {
+      return { interval: this._interval, minInterval: this._minInterval, pendingUpstreams: [], bootstrapUntil: 0, bootstrap: false };
+    }
+
+    const prevUntil = Number(torrent.bootstrapUntil) || 0;
+    if (prevUntil > 0 && prevUntil < now) {
+      // bootstrap window expired before the pending list was cleared: give up
+      return { interval: this._interval, minInterval: this._minInterval, pendingUpstreams: [], bootstrapUntil: 0, bootstrap: false };
+    }
+
+    const bootstrapUntil = prevUntil >= now
+      ? prevUntil
+      : now + BOOTSTRAP_WINDOW_FACTOR * BOOTSTRAP_INTERVAL * 1000;
+    const minInterval = Math.min(this._minInterval, BOOTSTRAP_INTERVAL);
+    return {
+      interval: Math.max(BOOTSTRAP_INTERVAL, minInterval),
+      minInterval,
+      pendingUpstreams: pending,
+      bootstrapUntil,
+      bootstrap: true
+    };
   }
 
   async _removePeer(infoHash, peerId) {
@@ -580,11 +767,6 @@ export class Tracker {
       [peers[i], peers[j]] = [peers[j], peers[i]];
     }
     return peers.slice(0, numwant);
-  }
-
-  async _fetchExternal(url, params) {
-    if (!this._externalFetch) return { ok: false };
-    return this._externalFetch(url, params);
   }
 
   _bencodeOk(extra = {}) {

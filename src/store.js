@@ -25,8 +25,13 @@
  *     createdAt: number,
  *     updatedAt: number,
  *     peers: Map<peerId, Peer>,  // serialized as object in JSON
- *     completed: number
+ *     completed: number,
+ *     // Upstream aggregation state, persisted per infohash (audit item 3):
+ *     pendingUpstreams?: string[], // upstream URLs still to query (Cloudflare 40-cap / budget skip)
+ *     bootstrapUntil?: number      // short-interval bootstrap deadline (epoch ms)
  *   }
+ * The aggregation state lives on the torrent record so it works with all three
+ * backends through the existing getTorrents()/putTorrent(infoHash, ...) API.
  * Peer shape:
  *   {
  *     peerId: string,
@@ -68,6 +73,11 @@ export class Store {
   async putTracker(url, config) { throw new Error('not implemented'); }
   async deleteTracker(url) { throw new Error('not implemented'); }
   async touchTracker(url) { return undefined; }
+  /* Mark several trackers as just used (dashboard usage stats). */
+  async touchTrackers(urls) {
+    if (!Array.isArray(urls) || urls.length === 0) return;
+    await Promise.allSettled(urls.map((url) => this.touchTracker(url)));
+  }
   async close() { return undefined; }
 
   /* Usage alerts (optional) */

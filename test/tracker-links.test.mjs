@@ -11,13 +11,35 @@ function announceUrl(extra = '') {
   return `http://tracker.local/announce?info_hash=${INFO_HASH}&peer_id=${PEER_ID}&port=6881&left=0&compact=1${extra}`;
 }
 
-function makeTracker({ store, externalFetch }) {
+/* Adapter stub: each planned upstream succeeds with the given peers. */
+function okAdapter(peers = [], { complete = 0, incomplete = 0 } = {}) {
+  return {
+    fetchPeersBatch: async (infoHash, params, urls) => ({
+      results: urls.map((url) => ({ url, ok: true, peers, complete, incomplete })),
+      pendingUrls: [],
+      unsupportedUrls: []
+    })
+  };
+}
+
+/* Adapter stub: every upstream fails. */
+function failAdapter() {
+  return {
+    fetchPeersBatch: async (infoHash, params, urls) => ({
+      results: urls.map((url) => ({ url, ok: false, error: 'upstream down' })),
+      pendingUrls: [],
+      unsupportedUrls: []
+    })
+  };
+}
+
+function makeTracker({ store, adapter }) {
   return new Tracker({
     store,
     interval: 1800,
     minInterval: 900,
     trackerId: 'test-tracker',
-    externalFetch
+    adapter
   });
 }
 
@@ -37,11 +59,11 @@ test('touchTracker records lastUsedAt in MemoryStore', async () => {
   assert.equal((await store.getTrackers()).has('http://missing.example/announce'), false);
 });
 
-test('getTrackerLinks marks a tracker as used today after a successful external fetch', async () => {
+test('getTrackerLinks marks a tracker as used today after a successful upstream fetch', async () => {
   const store = new MemoryStore();
   const tracker = makeTracker({
     store,
-    externalFetch: async () => ({ ok: true, peers: [{ ip: '1.2.3.4', port: 51413 }], complete: 1, incomplete: 0 })
+    adapter: okAdapter([{ ip: '1.2.3.4', port: 51413 }], { complete: 1 })
   });
 
   await tracker.addTracker('http://up.example/announce', true, 'upstream');
@@ -53,7 +75,7 @@ test('getTrackerLinks marks a tracker as used today after a successful external 
   assert.equal(links.trackers[0].usedToday, false);
   assert.equal(links.trackers[0].lastUsedAt, 0);
 
-  // announce triggers the external fetch and thus touchTracker
+  // announce triggers the upstream batch and thus touchTrackers
   const res = await tracker.handleRequest({ url: announceUrl() });
   assert.equal(res.status, 200);
 
@@ -65,7 +87,7 @@ test('getTrackerLinks marks a tracker as used today after a successful external 
 
 test('getTrackerLinks only returns enabled trackers', async () => {
   const store = new MemoryStore();
-  const tracker = makeTracker({ store, externalFetch: async () => ({ ok: false }) });
+  const tracker = makeTracker({ store, adapter: failAdapter() });
   await tracker.addTracker('http://enabled.example/announce', true);
   await tracker.addTracker('http://disabled.example/announce', false);
 
@@ -74,9 +96,9 @@ test('getTrackerLinks only returns enabled trackers', async () => {
   assert.equal(links.trackers[0].url, 'http://enabled.example/announce');
 });
 
-test('a failed external fetch does not mark the tracker as used', async () => {
+test('a failed upstream fetch does not mark the tracker as used', async () => {
   const store = new MemoryStore();
-  const tracker = makeTracker({ store, externalFetch: async () => ({ ok: false }) });
+  const tracker = makeTracker({ store, adapter: failAdapter() });
   await tracker.addTracker('http://down.example/announce', true);
 
   const res = await tracker.handleRequest({ url: announceUrl() });
@@ -89,7 +111,7 @@ test('a failed external fetch does not mark the tracker as used', async () => {
 
 test('getTrackerLinks({ includeDisabled: true }) returns disabled trackers too', async () => {
   const store = new MemoryStore();
-  const tracker = makeTracker({ store, externalFetch: async () => ({ ok: false }) });
+  const tracker = makeTracker({ store, adapter: failAdapter() });
   await tracker.addTracker('http://enabled.example/announce', true, 'on');
   await tracker.addTracker('http://disabled.example/announce', false, 'off');
 
@@ -103,7 +125,7 @@ test('getTrackerLinks({ includeDisabled: true }) returns disabled trackers too',
 
 test('getTrackerLinks({ date }) evaluates usedToday on the requested day', async () => {
   const store = new MemoryStore();
-  const tracker = makeTracker({ store, externalFetch: async () => ({ ok: true, peers: [] }) });
+  const tracker = makeTracker({ store, adapter: okAdapter([]) });
   await tracker.addTracker('http://up.example/announce', true);
 
   await tracker.handleRequest({ url: announceUrl() });
@@ -123,7 +145,7 @@ test('getTrackerLinks({ date }) evaluates usedToday on the requested day', async
 
 test('getTrackerLinks rejects an invalid date', async () => {
   const store = new MemoryStore();
-  const tracker = makeTracker({ store, externalFetch: async () => ({ ok: false }) });
+  const tracker = makeTracker({ store, adapter: failAdapter() });
 
   for (const bad of ['2026-13-01', '2026-02-30', '20261125', 'abc']) {
     const r = await tracker.getTrackerLinks({ date: bad });

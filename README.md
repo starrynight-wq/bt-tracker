@@ -8,6 +8,7 @@
 |------|------|
 | 🌐 **HTTP/HTTPS Tracker** | 标准 `/announce` 和 `/scrape` 接口，返回标准 bencode 响应 |
 | 👥 **Peer 联邦聚合** | 配置多个外部 tracker，客户端 announce 时自动向上游查询并将返回的有效 peer 与本地 peer 去重合并 |
+| ⏱️ **预算驱动并发聚合** | 上游查询并发且受 8s 预算约束；平台差异由 adapter 注入（Node 受控并发 / Cloudflare 单轮 ≤40 上游）；死上游不会拖垮整体响应 |
 | 🖥️ **网页管理面板** | `/dashboard` 提供可视化管理：统计卡片、外部 tracker 列表、种子列表、用量提醒 |
 | 📅 **今日 Tracker 使用情况** | 面板自动刷新，只显示当天成功使用过的外部 tracker（含最后使用时间），并提供全部 tracker 的使用状态徽标 |
 | 🔔 **用量提醒 (Alerts)** | 可为 `peers` / `torrents` / `announces` / `scrapes` 设定阈值，超过时通过 Webhook 或日志通知 |
@@ -28,7 +29,11 @@ bt-tracker/
 │   ├── bencode.js          # bencode 编解码（Node + Cloudflare Worker 通用）
 │   ├── store.js            # 存储层：MemoryStore / KvStore（CF KV），纯运行时无关代码
 │   ├── file-store.js       # FileStore（Node/Replit 文件持久化）
-│   ├── tracker.js          # Tracker 核心：announce/scrape/stats/admin/外部合并/提醒
+│   ├── tracker.js          # Tracker 核心：announce/scrape/stats/admin/预算驱动聚合/提醒
+│   ├── adapters/
+│   │   ├── common.js       # 上游请求公共实现（并发池、超时、bencode 解析、udp 过滤）
+│   │   ├── node.js         # Node/Replit adapter（受控并发 20-30）
+│   │   └── cloudflare.js   # Cloudflare adapter（单次 ≤40 上游、≤6 连接、跳过 udp）
 │   ├── server.js           # Node.js HTTP 服务器入口（Replit）
 │   ├── worker.js           # Cloudflare Workers 入口（CLI / Git 部署）
 │   ├── dashboard-html.js   # 【自动生成】dashboard.html 作为 ESM 字符串
@@ -36,8 +41,8 @@ bt-tracker/
 ├── scripts/
 │   ├── build.mjs           # 生成 dashboard-html.js 与 worker-bundle.js
 │   ├── test.mjs            # 运行 test/ 下的单元测试
-│   └── e2e-smoke.mjs       # Node 端到端冒烟测试
-├── test/                   # node:test 单元测试
+│   └── e2e-smoke.mjs       # Node 端到端冒烟测试（含黑洞上游的预算/部分结果验证）
+├── test/                   # node:test 单元测试（聚合、adapter、路由、使用统计）
 ├── .replit                 # Replit 运行配置
 ├── package.json            # Node 入口 (npm start → src/server.js)
 ├── wrangler.toml           # Cloudflare Workers 部署配置
@@ -48,13 +53,17 @@ bt-tracker/
 > `src/dashboard-html.js` 和 `src/worker-bundle.js` 由 `npm run build` 从
 > `public/dashboard.html` 与 `src/*.js` 自动生成，请不要手动修改；修改页面后重新构建即可。
 
+> **用途声明**：本项目**不是通用代理**，仅用于 BitTorrent Tracker 的 announce 聚合
+> （把客户端 announce 转发给配置的上游 tracker 并合并返回的 peer）。请仅在合法、
+> 授权场景下部署，遵守 Cloudflare / Replit 的服务条款。
+
 ### 本地开发与构建
 
 ```bash
 npm start          # 启动 Node/Replit 服务器（http://localhost:3000）
 npm run build      # 重新生成 dashboard-html.js 和 worker-bundle.js
-npm test           # 单元测试（tracker 使用统计、worker/bundle 路由、Pages Functions）
-npm run smoke      # 端到端测试：announce → 上游 tracker → 今日使用统计
+npm test           # 单元测试（聚合预算/bootstrap、adapter、worker/bundle 路由、使用统计）
+npm run smoke      # 端到端：announce → 上游聚合（含黑洞上游）→ 今日使用统计
 ```
 
 ---
@@ -113,6 +122,9 @@ Replit 是最快的上手方式，无需安装任何工具，在浏览器里即�
 | `TRACKERS_PATH` | `data/trackers.json` | 外部 tracker 配置文件路径 |
 | `ALERTS_PATH` | `data/alerts.json` | 提醒规则文件路径 |
 | `DASHBOARD_PATH` | `public/dashboard.html` | 管理面板 HTML 路径 |
+| `TRACKER_ANNOUNCE_BUDGET_MS` | `8000` | 单次 announce 的上游聚合总预算（毫秒） |
+| `TRACKER_UPSTREAM_CONCURRENCY` | `24` | 同时连接的上游数量上限（Node，1–30） |
+| `TRACKER_UPSTREAM_TIMEOUT_MS` | `3000` | 单个上游请求超时（毫秒，≤5000 且不超过剩余预算） |
 
 ---
 
@@ -165,6 +177,8 @@ Cloudflare Workers 将你的 Tracker 部署到全球边缘节点，访问速度�
      | `BT_INTERVAL` | `1800` | Announce 间隔（秒） |
      | `BT_MIN_INTERVAL` | `900` | 最小 announce 间隔（秒） |
      | `BT_TRACKER_ID` | `bt-tracker` | Tracker 标识 |
+     | `BT_ANNOUNCE_BUDGET_MS` | `8000` | 单次 announce 上游聚合总预算（毫秒） |
+     | `BT_UPSTREAM_TIMEOUT_MS` | `2500` | 单个上游请求超时（毫秒，≤5000） |
    - 不填则使用默认值。
 
 5. **访问 Tracker**
@@ -271,7 +285,7 @@ Pages 适合把管理面板作为静态站点托管，同时用 Pages Functions 
      | `BT_TORRENTS` | BT_TORRENTS |
      | `BT_TRACKERS` | BT_TRACKERS |
      | `BT_ALERTS` | BT_ALERTS |
-   - 同页面的 **环境变量** 中可选添加 `BT_INTERVAL=1800`、`BT_MIN_INTERVAL=900`、`BT_TRACKER_ID=bt-tracker`。
+   - 同页面的 **环境变量** 中可选添加 `BT_INTERVAL=1800`、`BT_MIN_INTERVAL=900`、`BT_TRACKER_ID=bt-tracker`、`BT_ANNOUNCE_BUDGET_MS=8000`、`BT_UPSTREAM_TIMEOUT_MS=2500`。
 
 5. **部署并访问**
    - 推送到 GitHub 触发自动部署。
@@ -493,23 +507,66 @@ curl -X POST http://你的-tracker/admin/import -H 'Content-Type: application/js
 
 ## 🔧 原理说明
 
-### 外部 tracker 联邦
+### 外部 tracker 聚合（预算驱动）
 
 当客户端发起 `/announce` 时，Tracker 会：
 
-1. 将本地 peer 记录/更新；
-2. 向所有**启用**的外部 tracker 发起相同的 announce 请求（超时 8 秒，避免死上游阻塞）；
-3. 解码上游返回的 bencode 响应，提取 compact peer 列表；
-4. 按 `ip:port` 去重，与本地 peer 合并；
-5. 按 `numwant` 截断后返回给客户端。
+1. 在内存中记录/更新本地 peer（一次读取 + 一次写回，减少 KV 操作）；
+2. 组装本轮要查询的**启用**上游列表（上次未查完的 `pendingUpstreams` 优先，然后其余启用 tracker）；
+3. 通过平台 adapter 发起**并发**批量请求，整体受 `budgetMs`（默认 8000ms，为客户端 ~10s 接收超时留 2s 余量）限制；
+4. adapter 返回已 settled 的结果（成功/失败/超时），未能在预算内查询的 URL 作为 pending 持久化；
+5. 用简单的 `Set<ip:port>` 去重，合并本地 peer 与上游 peer，按 `numwant` 截断后返回；
+6. 只要有任何结果就返回合法 bencode；即使所有上游都超时，也返回「空 peers + 合理 interval」的有效响应，而不是错误。
+
+> 历史问题（本次修复）：此前聚合是 `for...of` + `await` 的串行查询，且 `worker.js` 的
+> `externalFetch` 没有超时；N 个死上游会串行累积等待，客户端可能在收到响应前超时。
+> 现在 adapter 内部使用 `Promise.allSettled` + 受控并发 + 单请求超时，且 tracker 侧还有一层
+> 硬预算竞速兜底；聚合路径中不存在 `Promise.all`，也不存在无边界的串行 `await` 遍历。
+
+#### 平台 adapter（同一套核心逻辑）
+
+| adapter | 文件 | 行为 |
+|---------|------|------|
+| Node / Replit | `src/adapters/node.js` | 受控并发（默认 24，范围 1–30）+ `Promise.allSettled`；单请求超时默认 3000ms（≤5000 且不超过剩余预算） |
+| Cloudflare Workers / Pages | `src/adapters/cloudflare.js` | 单次最多查询 **40** 个上游（免费版子请求上限 50，预留 10 个给 KV/等）；最多 **6** 个并发连接；单请求超时默认 2500ms；跳过 `udp://` |
+
+两者都实现同一接口：
+
+```js
+fetchPeersBatch(infoHash, peerParams, upstreamUrls, budgetMs)
+  -> { results, pendingUrls, unsupportedUrls, queried, planned }
+```
+
+`tracker.js` 里没有任何 `if (isCloudflare)` 平台分支；Node 与 Workers 只是注入不同 adapter。
+
+#### 短间隔引导（bootstrap）
+
+当本轮有上游**没查完**（Cloudflare 40 上限截断，或预算耗尽导致部分请求未开始）时：
+
+1. 把未查询的 URL 写入该 infohash 记录的 `pendingUpstreams`；
+2. 返回 `interval = 120s`，同时把 `min interval` 降为 ≤120s（保证短间隔对客户端是合规的）；
+3. 记录 `bootstrapUntil = now + 5 × 120s`；
+4. 客户端约 2 分钟后再次 announce 时，优先查询 pending 上游；
+5. pending 清空 **或** bootstrap 窗口过期后，恢复 `DEFAULT_INTERVAL = 1800s`（过期的旧 pending 会被丢弃）。
+
+短间隔只用于「结果不完整」的引导阶段，不会长期把 interval 压在 60–120s。
+
+#### Cloudflare 免费版硬约束（已写入代码）
+
+- **外部子请求 ≤ 50/次**：`cloudflare.js` 硬编码单轮上限 40，其余进 pending，下次 announce 继续；
+- **CPU 10ms/次**：Worker 主体不做复杂排序/去重；peer 去重是简单的 `Set<ip:port>`，并且放在 adapter 返回之后；
+- **同时连接数 ≤ 6**：Cloudflare adapter 的连接池大小就是 6；
+- **UDP Tracker 不可用**：`udp://` 开头 URL 在两种 adapter 中都会直接跳过并打日志（`unsupported`），不进入 fetch 循环、不消耗预算/子请求；
+- **用途限定**：本项目不是通用代理，只处理 BitTorrent Tracker 的 announce 聚合，请勿用于其他转发用途。
 
 ### 外部 tracker 使用统计（今日使用）
 
 面板中的「📅 今日使用的外部 Tracker」不是靠定时探测，而是记录**真实使用**：
 
 1. 每个外部 tracker 配置里新增 `lastUsedAt`（毫秒时间戳，默认 0 = 从未使用）。
-2. `/announce` 合并上游时，只要某个启用 tracker 的 announce 成功返回（`res.ok`），就调用
-   `store.touchTracker(url)` 把它的 `lastUsedAt` 更新为当前时间；失败的上游不会更新。
+2. `/announce` 聚合上游时，只要某个启用 tracker 的 announce 成功返回（`res.ok === true`），
+   就把该 URL 收集到一起，聚合结束后调用一次 `store.touchTrackers(urls)` 批量更新
+   `lastUsedAt`；失败或超时的上游不会更新。
 3. `GET /admin/tracker-links` 读取所有 tracker，并将 `lastUsedAt` 与「统计日」的
    00:00:00–24:00:00 区间比较，得到 `usedToday`（统计日可用 `?date=YYYY-MM-DD` 指定，
    默认今天）。
@@ -540,11 +597,13 @@ UTC）。因此 Workers/Pages 部署下统计日以 UTC 零点切换；如需按
 
 ## ⚠️ 注意事项
 
-1. **外部 tracker 超时**：Node 环境下外部请求超时约 8 秒，Cloudflare Workers 使用默认超时；死上游不会阻塞客户端响应。
+1. **上游超时/预算**：单次 announce 的上游聚合总预算默认 8 秒（Node/Workers 一致）；单个上游超时 2.5–3 秒，死上游不会阻塞整体响应。Cloudflare 免费版单次最多查询 40 个上游，未查完的会留到下一次 announce。
 2. **Peer TTL**：默认 30 分钟，长时间未 announce 的 peer 会在选择时被过滤。
 3. **Cloudflare KV 限制**：单个值上限 25 MB，适合中小规模 tracker；大规模使用建议自行扩展存储层。
 4. **安全性**：当前版本的管理接口没有鉴权，建议在生产环境前通过 Cloudflare Access、Replit 权限或反向代理增加访问控制。
 5. **IPv6**：当前 compact peer 仅支持 IPv4，IPv6 peer 会被过滤。
+6. **UDP Tracker**：当前不支持 `udp://` 上游（Cloudflare 标准运行时无 UDP；Node 侧也未实现 dgram），会被跳过并记录日志。
+7. **使用范围**：本项目不是通用代理，仅用于 BitTorrent Tracker announce 聚合；请遵守平台服务条款。
 
 ---
 

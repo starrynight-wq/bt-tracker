@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 
 import worker from '../src/worker.js';
 import bundle from '../src/worker-bundle.js';
+import { decodeSync } from '../src/bencode.js';
 
 const DASHBOARD_HTML = await readFile(new URL('../public/dashboard.html', import.meta.url), 'utf8');
 
@@ -113,5 +114,48 @@ for (const [name, impl] of [['worker.js', worker], ['worker-bundle.js', bundle]]
     const badBody = await bad.json();
     assert.equal(badBody.ok, false);
     assert.equal(badBody.error, 'invalid date, expected YYYY-MM-DD');
+  });
+
+  test(`${name}: /announce returns valid bencode without configured upstreams`, async () => {
+    const env = makeEnv();
+    const res = await impl.fetch(request(
+      'https://tracker.test/announce?info_hash=0123456789abcdef0123456789abcdef01234567&peer_id=abcdefghijklmnopqrst&port=6881&left=0&compact=1'
+    ), env);
+    assert.equal(res.status, 200);
+    const body = decodeSync(new Uint8Array(await res.arrayBuffer()));
+    assert.equal(body['failure reason'], undefined);
+    assert.ok(Array.isArray(body.peers) || body.peers instanceof Uint8Array);
+    assert.equal(body.interval, 1800);
+  });
+
+  test(`${name}: /announce stays inside the budget when an upstream hangs`, async () => {
+    const env = makeEnv();
+    env.BT_ANNOUNCE_BUDGET_MS = '300';
+    const addRes = await impl.fetch(request('https://tracker.test/admin/trackers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'http://hung.example/announce', enabled: true })
+    }), env);
+    assert.equal(addRes.status, 200);
+
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = () => new Promise(() => {}); // simulate a black-holed upstream
+    const started = Date.now();
+    let res;
+    try {
+      res = await impl.fetch(request(
+        'https://tracker.test/announce?info_hash=0123456789abcdef0123456789abcdef01234567&peer_id=abcdefghijklmnopqrst&port=6881&left=0&compact=1'
+      ), env);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    const elapsed = Date.now() - started;
+
+    assert.equal(res.status, 200);
+    assert.ok(elapsed < 3000, `announce took ${elapsed}ms with budget=300ms`);
+    const body = decodeSync(new Uint8Array(await res.arrayBuffer()));
+    assert.equal(body['failure reason'], undefined);
+    // the hung upstream is pending -> bootstrap interval is advertised
+    assert.ok(body.interval >= 120 && body.interval <= 1800);
   });
 }
